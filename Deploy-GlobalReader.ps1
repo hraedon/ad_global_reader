@@ -58,7 +58,7 @@
       - SAMR / restricted-group policy
       - Auditing pre-existing permissive ACEs
 
-    Version : 1.0
+    Version : 1.2
     Author  : AD-GR Deployer (Claude Code / Anthropic)
     Domain  : Derived at runtime — no hardcoded values
 #>
@@ -114,7 +114,7 @@ $TargetDN = if ($TargetOU) { $TargetOU } else { $DomainDN }
 
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor DarkCyan
-Write-Host "  AD Global Reader Deployer  v1.0" -ForegroundColor Cyan
+Write-Host "  AD Global Reader Deployer  v1.2" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor DarkCyan
 Write-Host "  Domain   : $DomainFQDN" -ForegroundColor White
 Write-Host "  Target DN: $TargetDN" -ForegroundColor White

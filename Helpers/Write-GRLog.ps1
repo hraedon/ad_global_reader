@@ -5,7 +5,11 @@
 .DESCRIPTION
     Appends a structured log entry to the deployment CSV log.
     Creates the log file with headers if it does not yet exist.
-    Thread-safe via mutex for concurrent invocation scenarios.
+    File writes are serialised with a named Win32 mutex derived from the log
+    path, so concurrent deployer instances targeting the same file do not
+    interleave rows. The mutex is acquired with a 5-second timeout; if the
+    timeout expires the write proceeds anyway rather than silently dropping
+    the log entry.
 #>
 
 function Write-GRLog {
@@ -41,15 +45,28 @@ function Write-GRLog {
         New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
 
-    # Write header if file is new
-    if (-not (Test-Path $LogPath)) {
-        "Timestamp,TargetDN,Action,Principal,Details" | Out-File -FilePath $LogPath -Encoding utf8 -Force
-    }
+    # Named mutex — one per unique log path, scoped to the local machine.
+    # Sanitise the path into a valid mutex name (no backslashes etc. after the prefix).
+    $safeName  = 'Local\GR-Log-' + ($LogPath -replace '[\\/:*?"<>|]', '_')
+    $mutex     = [System.Threading.Mutex]::new($false, $safeName)
+    $acquired  = $false
+    try {
+        $acquired = $mutex.WaitOne(5000)   # 5-second timeout
 
-    # Escape commas/quotes in fields for valid CSV
-    $row = ($entry.Timestamp, $entry.TargetDN, $entry.Action, $entry.Principal, $entry.Details) |
-        ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
-    ($row -join ',') | Out-File -FilePath $LogPath -Encoding utf8 -Append
+        # Write header if file is new
+        if (-not (Test-Path $LogPath)) {
+            "Timestamp,TargetDN,Action,Principal,Details" | Out-File -FilePath $LogPath -Encoding utf8 -Force
+        }
+
+        # Escape commas/quotes in fields for valid CSV
+        $row = ($entry.Timestamp, $entry.TargetDN, $entry.Action, $entry.Principal, $entry.Details) |
+            ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }
+        ($row -join ',') | Out-File -FilePath $LogPath -Encoding utf8 -Append
+    }
+    finally {
+        if ($acquired) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
 
     # Mirror to console with colour coding
     $colour = switch ($Action) {
