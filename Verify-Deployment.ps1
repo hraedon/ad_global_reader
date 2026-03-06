@@ -3,11 +3,40 @@
 <#
 .SYNOPSIS
     Verifies the Global Reader ACE is present and runs an idempotency test.
-    This script is used for post-deployment validation only.
+
+.DESCRIPTION
+    Checks that the specified security group exists in AD and that an explicit
+    Allow ACE (ReadProperty, ListChildren, ListObject) for that group is present
+    on the target DN. Then re-runs the deployer to confirm idempotency (no
+    duplicate ACE or group creation).
+
+.PARAMETER IdentityName
+    Name of the Global Reader security group to verify.
+    Default: GS-Global-Readers
+
+.PARAMETER TargetDN
+    Distinguished Name of the container where the ACE should be present.
+    If omitted, the domain root DN is used.
+
+.EXAMPLE
+    # Verify defaults
+    .\Verify-Deployment.ps1
+
+.EXAMPLE
+    # Verify a custom group on a specific OU
+    .\Verify-Deployment.ps1 -IdentityName 'GS-Global-Readers' -TargetDN 'OU=Servers,DC=ad,DC=hraedon,DC=com'
 #>
 
-$TargetDN     = (Get-ADDomain).DistinguishedName
-$IdentityName = 'GS-Global-Readers'
+[CmdletBinding()]
+param(
+    [string]$IdentityName = 'GS-Global-Readers',
+    [string]$TargetDN     = ''
+)
+
+# Resolve TargetDN at runtime if not supplied
+if (-not $TargetDN) {
+    $TargetDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+}
 
 Write-Host ''
 Write-Host '=== ACE Verification ===' -ForegroundColor Cyan
@@ -21,7 +50,7 @@ if (-not $group) {
 Write-Host "OK  : Group '$($group.DistinguishedName)' exists." -ForegroundColor Green
 Write-Host "      SID: $($group.SID.Value)"
 
-# 2. Check ACE on domain root
+# 2. Check ACE on target DN
 $acl      = Get-Acl -Path "AD:\$TargetDN"
 $groupSid = $group.SID.Value
 
@@ -42,13 +71,16 @@ else {
     exit 1
 }
 
-# 3. Idempotency test -- re-run deployer; expect ACE_Exists_Skipping and Group_Exists_Skipping
+# 3. Idempotency test -- re-run deployer with matching params; expect skips, no errors
 Write-Host ''
 Write-Host '=== Idempotency Test ===' -ForegroundColor Cyan
 $stamp   = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $logPath = Join-Path $PSScriptRoot "Logs\GR-Idempotency-$stamp.csv"
 
-& (Join-Path $PSScriptRoot 'Deploy-GlobalReader.ps1') -LogPath $logPath
+& (Join-Path $PSScriptRoot 'Deploy-GlobalReader.ps1') `
+    -IdentityName $IdentityName `
+    -TargetOU     $TargetDN `
+    -LogPath      $logPath
 
 $log    = Import-Csv $logPath
 $skips  = @($log | Where-Object { $_.Action -in @('ACE_Exists_Skipping','Group_Exists_Skipping') })
