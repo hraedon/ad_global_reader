@@ -102,11 +102,7 @@ function Set-GRDelegation {
         return
     }
 
-    # ---- Log before-state (summary) ----------------------------------------
     $beforeCount = $acl.Access.Count
-    Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action ACE_Added `
-        -Principal $IdentityName `
-        -Details "Before: $beforeCount ACEs on target. Preparing to add Global Reader ACE."
 
     # ---- Build the ACE -----------------------------------------------------
     #
@@ -149,7 +145,7 @@ function Set-GRDelegation {
             $afterCount = (Get-Acl -Path $adPath -ErrorAction Stop).Access.Count
             Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action ACE_Added `
                 -Principal $IdentityName `
-                -Details "ACE successfully applied. Rights: ReadProperty|ListChildren|ListObject, Inheritance: All. ACE count: $beforeCount -> $afterCount."
+                -Details "ACE applied. Rights: ReadProperty|ListChildren|ListObject, Inheritance: All. ACE count before: $beforeCount, after: $afterCount."
         }
     }
     catch {

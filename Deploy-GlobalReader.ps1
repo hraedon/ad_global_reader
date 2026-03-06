@@ -155,7 +155,7 @@ $groupParams = @{
 if ($GroupOU) { $groupParams['GroupOU'] = $GroupOU }
 
 try {
-    $grGroup = New-GRGroup @groupParams
+    $grGroup = New-GRGroup @groupParams -WhatIf:$WhatIfPreference
     Write-Host "[Step 2/3] Group ready: $($grGroup.DistinguishedName)" -ForegroundColor Green
 }
 catch {
@@ -174,7 +174,7 @@ catch {
 Write-Host "[Step 3/3] Applying Global Reader ACE to '$TargetDN'..." -ForegroundColor DarkCyan
 
 try {
-    Set-GRDelegation -TargetDN $TargetDN -IdentityName $IdentityName -LogPath $LogPath
+    Set-GRDelegation -TargetDN $TargetDN -IdentityName $IdentityName -LogPath $LogPath -WhatIf:$WhatIfPreference
     Write-Host "[Step 3/3] ACL delegation complete." -ForegroundColor Green
 }
 catch {

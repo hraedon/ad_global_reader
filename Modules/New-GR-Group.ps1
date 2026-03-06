@@ -4,7 +4,7 @@
 .SYNOPSIS
     Creates the Global Reader security group if it does not already exist.
 .DESCRIPTION
-    Idempotent: if the group already exists the function logs ACE_Exists_Skipping
+    Idempotent: if the group already exists the function logs Group_Exists_Skipping
     and returns the existing group object without modification.
     Sets ProtectedFromAccidentalDeletion = $true on the group.
 #>

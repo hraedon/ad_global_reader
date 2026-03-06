@@ -46,7 +46,7 @@ else {
 Write-Host ''
 Write-Host '=== Idempotency Test ===' -ForegroundColor Cyan
 $stamp   = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-$logPath = "C:\projects\ad-global-reader\ad_global_reader\Logs\GR-Idempotency-$stamp.csv"
+$logPath = Join-Path $PSScriptRoot "Logs\GR-Idempotency-$stamp.csv"
 
 & (Join-Path $PSScriptRoot 'Deploy-GlobalReader.ps1') -LogPath $logPath
 

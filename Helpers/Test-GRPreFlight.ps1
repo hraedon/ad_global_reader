@@ -56,50 +56,55 @@ function Test-GRPreFlight {
         return $false
     }
 
-    # ---- 3. Privilege check: can we read the DACL on $TargetDN? -----------
+    # ---- 3. Privilege check: does the current token have WriteDacl on $TargetDN? ---
+    # Strategy: enumerate every SID in the current Windows token (identity + all
+    # groups), then walk the target object's DACL looking for an Allow ACE with
+    # WriteDacl or GenericAll that matches any of those SIDs.
+    # This approach works across trusts (no role-name string matching) and tests
+    # the specific target object rather than assuming inherited rights.
+    # Note: Deny ACEs and ACE ordering are not evaluated — this is a best-effort
+    # pre-check. Set-Acl will still fail with a hard error if the right is absent.
     try {
-        $adPath = "AD:\$TargetDN"
-        $acl    = Get-Acl -Path $adPath -ErrorAction Stop
+        $adPath  = "AD:\$TargetDN"
+        $acl     = Get-Acl -Path $adPath -ErrorAction Stop
 
-        # Verify the current user has WriteDacl or GenericAll on the object.
-        # We test by checking the token for the SeSecurityPrivilege or by verifying
-        # the DACL contains a relevant Allow entry for us. The practical test is
-        # whether we can actually read the DACL (done above) and whether our token
-        # includes the required right via group membership.
-        # A reliable runtime check: attempt to build a throwaway ACE and validate
-        # the ACL object is writable (does not set it yet).
-        $testSid  = (New-Object System.Security.Principal.NTAccount($principal)).Translate(
-                        [System.Security.Principal.SecurityIdentifier])
-        $hasRight = $acl.Access | Where-Object {
-            ($_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $testSid.Value) -and
-            (
-                ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) -ne 0 -or
-                ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll)  -ne 0
-            ) -and
-            ($_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow)
+        # Collect all SIDs present in the current token
+        $tokenIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $tokenSids     = [System.Collections.Generic.HashSet[string]]::new()
+        $null = $tokenSids.Add($tokenIdentity.User.Value)
+        foreach ($grp in $tokenIdentity.Groups) {
+            try { $null = $tokenSids.Add($grp.Value) } catch {}
+        }
+
+        $hasRight    = $false
+        $matchedSid  = $null
+        foreach ($ace in $acl.Access) {
+            if ($ace.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+            $hasWriteDacl  = ($ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl)  -ne 0
+            $hasGenericAll = ($ace.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll)  -ne 0
+            if (-not ($hasWriteDacl -or $hasGenericAll)) { continue }
+
+            $aceSid = $null
+            try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { continue }
+
+            if ($tokenSids.Contains($aceSid)) {
+                $hasRight   = $true
+                $matchedSid = $aceSid
+                break
+            }
         }
 
         if ($hasRight) {
             Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action PreFlight_OK `
-                -Principal $principal -Details 'Explicit WriteDacl/GenericAll ACE found for current identity on target DN.'
+                -Principal $principal `
+                -Details "WriteDacl/GenericAll confirmed on target object via token SID $matchedSid."
         }
         else {
-            # Domain Admins inherit WriteDacl from AdminSDHolder propagation; a direct
-            # ACE may not exist.  Membership in Domain Admins is a reliable proxy.
-            $isDomainAdmin = ([System.Security.Principal.WindowsPrincipal](
-                [System.Security.Principal.WindowsIdentity]::GetCurrent()
-            )).IsInRole('Domain Admins')
-
-            if ($isDomainAdmin) {
-                Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action PreFlight_OK `
-                    -Principal $principal -Details 'Current identity is a member of Domain Admins — inherited WriteDacl assumed.'
-            }
-            else {
-                Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action PreFlight_Warning `
-                    -Principal $principal `
-                    -Details 'Could not confirm WriteDacl right for current identity. Set-Acl may fail. Continuing with warning.'
-                # This is a warning, not a hard stop — Set-Acl will surface the real error if needed.
-            }
+            Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action PreFlight_Warning `
+                -Principal $principal `
+                -Details 'No explicit WriteDacl/GenericAll ACE found for any token SID on the target object. Set-Acl may fail. Continuing — the real error will surface there if rights are insufficient.'
+            # Not a hard stop: inherited rights (e.g. from Builtin\Administrators) may
+            # not appear as explicit ACEs but can still grant the right at runtime.
         }
     }
     catch {
