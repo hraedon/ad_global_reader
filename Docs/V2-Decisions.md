@@ -138,3 +138,25 @@ New action types added (v2):
 3. **Pester 3.4.0 inbox version:** Unit tests require Pester v5. `Bootstrap.ps1` handles installation automatically.
 
 4. **RemoveAccessRule on mocked ACL:** Unit tests for ACE removal cannot fully mock `RemoveAccessRule` on a `PSCustomObject`. Integration tests cover this path.
+
+---
+
+## Code Signing (delivered post-v2)
+
+**Background:** Signing was flagged as a v3 candidate in the project reflection. It was promoted to an immediate deliverable when the source project (`AD Landing Zone deployer`) already contained a signing helper (`Sign-LZScripts.ps1`) that could be adapted.
+
+**Decision: `Helpers\Sign-GRScripts.ps1`, adapted from Sign-LZScripts.ps1**
+
+The LZ signing script was a clean, direct template: certificate resolution from CurrentUser/LocalMachine stores, EKU validation, expiry warning, per-file `Set-AuthenticodeSignature` with optional RFC 3161 timestamp, and a signed/skipped/failed summary. The adaptation required only updating the file manifest and synopsis.
+
+**Key design choice — `-IncludeTests` switch:**
+Test scripts are development artifacts. In most production environments running `AllSigned`, the test suite is never executed on the production machine, so signing test files is unnecessary overhead. The default manifest covers only the 12 production scripts. `-IncludeTests` opts in for the 5 Pester files when tests must run in an AllSigned session.
+
+**Invoke workaround documentation:**
+The `ScriptBlock::Create` / `Invoke-Expression` bypass pattern was explicitly documented in the script's `.DESCRIPTION` and in the README. This pattern is commonly found in operator runbooks as a quick fix for unsigned scripts; it circumvents both `ExecutionPolicy` and Authenticode verification and must not be used where AllSigned is a security control rather than a convenience setting.
+
+**Dot-source coverage note:**
+A non-obvious requirement is that every file the deployer dot-sources (`. (Join-Path $PSScriptRoot 'Modules\...')`) must be individually signed. PowerShell validates each file at load time, not just the entry-point script. This is why `Sign-GRScripts.ps1` signs all 12 files in the tree rather than just the two orchestrators. This was called out explicitly in the script `.DESCRIPTION` to prevent operators from partially signing the tree and hitting a confusing mid-run policy error.
+
+**Re-signing after edits:**
+`Set-AuthenticodeSignature` appends a signature block to the file. Any subsequent edit invalidates it. Operators must re-run `Sign-GRScripts.ps1` after every change to any file in the tree before deploying to an `AllSigned` environment. This is documented in the README.

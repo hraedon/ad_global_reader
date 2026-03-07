@@ -40,6 +40,7 @@ ad_global_reader/
   Helpers/
     Write-GRLog.ps1             # CSV + console logging
     Test-GRPreFlight.ps1        # Pre-flight checks
+    Sign-GRScripts.ps1          # Authenticode signing for AllSigned environments
   Tests/
     Bootstrap.ps1               # Pester v5 installer and test runner
     New-GR-Group.Tests.ps1      # Unit tests
@@ -314,6 +315,46 @@ All operations write a UTF-8 CSV at `$LogPath`. Logs are written even under `-Wh
 - `ControlAccess` — no Extended Rights of any kind, including *Read Password*, *Return Property*, *DS-Replication-Get-Changes*
 - `WriteProperty`, `WriteDacl`, `WriteOwner`, `Delete`, `DeleteTree`
 - Access to **confidential attributes** (`searchFlags` bit 128 in the schema, e.g., LAPS `ms-LAPS-Password`, `ms-PKI-DPAPIMasterKeys`) — these require an explicit `ControlAccess` delegation that this deployer never grants
+
+---
+
+## Code signing (AllSigned environments)
+
+Environments that enforce an `AllSigned` execution policy via GPO require every `.ps1` file to carry a valid Authenticode signature — including dot-sourced helpers and modules, not just the entry-point scripts.
+
+`Helpers\Sign-GRScripts.ps1` handles this in one pass.
+
+```powershell
+# Sign all production scripts
+.\Helpers\Sign-GRScripts.ps1 -Thumbprint 'A1B2C3D4E5F6...'
+
+# With an RFC 3161 timestamp (recommended for production)
+.\Helpers\Sign-GRScripts.ps1 -Thumbprint 'A1B2C3D4E5F6...' `
+    -TimestampServer 'http://timestamp.digicert.com'
+
+# Also sign test scripts (if running Pester in an AllSigned session)
+.\Helpers\Sign-GRScripts.ps1 -Thumbprint 'A1B2C3D4E5F6...' `
+    -TimestampServer 'http://timestamp.digicert.com' -IncludeTests
+```
+
+The certificate must carry the Code Signing EKU (`1.3.6.1.5.5.7.3.3`) and resolve to a trusted root on the target machine. The script validates both before signing.
+
+**Invoke workaround — do not use in production:**
+A common bypass for unsigned scripts is to read the file content and execute it as a ScriptBlock:
+```powershell
+# These bypass ExecutionPolicy but also bypass Authenticode verification entirely
+& ([ScriptBlock]::Create((Get-Content $path -Raw)))
+Invoke-Expression (Get-Content $path -Raw)
+```
+PowerShell's `AllSigned` policy applies to script *files*, not ScriptBlock literals. These patterns defeat the security purpose of code signing. Sign all constituent scripts with `Sign-GRScripts.ps1` instead.
+
+For development sessions without AllSigned, a per-process bypass is safe:
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+# Reverts automatically when the session ends; does not modify machine or user policy
+```
+
+**Re-signing after edits:** `Set-AuthenticodeSignature` appends a signature block to the file. Any edit — even a single character — invalidates the signature. Re-run `Sign-GRScripts.ps1` after every change before deploying to an AllSigned environment.
 
 ---
 
