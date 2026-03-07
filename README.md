@@ -1,4 +1,4 @@
-# AD Global Reader Deployer
+# AD Global Reader Deployer — v2
 
 Idempotent PowerShell deployer that creates a **read-only Active Directory role** for SIEM ingestion, auditing, and security posture management.
 
@@ -19,6 +19,7 @@ Allow | ReadProperty, ListChildren, ListObject | Inheritance: All
 | PowerShell | 5.1 or later |
 | RSAT module | `ActiveDirectory` (included in RSAT on Windows Server; install via `Add-WindowsCapability` on workstations) |
 | Execution context | Domain Admin, or an account with **WriteDacl** on the target container |
+| Pester | v5+ (required for tests; auto-installed by `Tests\Bootstrap.ps1`) |
 
 ---
 
@@ -26,20 +27,35 @@ Allow | ReadProperty, ListChildren, ListObject | Inheritance: All
 
 ```
 ad_global_reader/
-  Deploy-GlobalReader.ps1       # Orchestrator — run this
-  Verify-Deployment.ps1         # Post-deploy verification and idempotency test
+  Deploy-GlobalReader.ps1       # Orchestrator: create group + apply ACE
+  Remove-GlobalReader.ps1       # Orchestrator: remove ACE (and optionally group)
+  Get-GRReport.ps1              # Audit and reporting
+  Verify-Deployment.ps1         # Post-deploy verification (v1; see note below)
   Modules/
     New-GR-Group.ps1            # Security group creation
     Set-GR-Delegation.ps1       # ACL delegation
+    Remove-GR-Delegation.ps1    # ACL removal
+    Set-GR-AdminSDHolder.ps1    # AdminSDHolder ACE application
+    Remove-GR-AdminSDHolder.ps1 # AdminSDHolder ACE removal
   Helpers/
     Write-GRLog.ps1             # CSV + console logging
     Test-GRPreFlight.ps1        # Pre-flight checks
+  Tests/
+    Bootstrap.ps1               # Pester v5 installer and test runner
+    New-GR-Group.Tests.ps1      # Unit tests
+    Set-GR-Delegation.Tests.ps1 # Unit tests
+    Remove-GR-Delegation.Tests.ps1 # Unit tests
+    Integration.Tests.ps1       # Integration tests (requires domain-joined session)
+  Docs/
+    V2-Decisions.md             # Design decisions and rationale for v2
+    DSC-Evaluation.md           # Evaluation of DSC for role drift remediation
   Logs/                         # Runtime CSV logs (git-ignored)
+  Logs/Reports/                 # Get-GRReport HTML/CSV output (git-ignored)
 ```
 
 ---
 
-## Usage
+## Deploy
 
 ### Deploy with defaults
 
@@ -65,7 +81,23 @@ Targets the domain root. Creates `GS-Global-Readers` in `CN=Users`.
     -GroupOU      'OU=SecurityGroups,OU=Admin,DC=ad,DC=example,DC=com'
 ```
 
-### Dry run (no changes made)
+### Deploy with AdminSDHolder coverage
+
+Closes the AdminSDHolder gap so that domain-protected accounts (Domain Admins, Schema Admins, etc.) are also readable. Requires `-Force` to acknowledge the security implication.
+
+```powershell
+.\Deploy-GlobalReader.ps1 -ApplyAdminSDHolder -Force
+```
+
+To immediately propagate via SDProp (rather than waiting up to 60 minutes):
+
+```powershell
+.\Deploy-GlobalReader.ps1 -ApplyAdminSDHolder -Force -TriggerSDProp
+```
+
+### Dry run
+
+All operations are simulated. No changes are made to AD. A CSV log is still written with a `WhatIf_Active` marker row so the simulated run is auditable.
 
 ```powershell
 .\Deploy-GlobalReader.ps1 -WhatIf
@@ -79,15 +111,107 @@ Targets the domain root. Creates `GS-Global-Readers` in `CN=Users`.
 
 ---
 
-## Parameters
+## Deploy parameters
 
 | Parameter | Default | Description |
 |---|---|---|
 | `-IdentityName` | `GS-Global-Readers` | Name of the security group to create or use |
 | `-TargetOU` | Domain root DN | DN of the container to receive the ACE |
 | `-GroupOU` | Domain `CN=Users` container | DN of the OU in which to create the group |
+| `-ApplyAdminSDHolder` | `$false` | Also apply the ACE to `CN=AdminSDHolder,CN=System,...` |
+| `-Force` | `$false` | Required when `-ApplyAdminSDHolder` is specified |
+| `-TriggerSDProp` | `$false` | Trigger immediate SDProp propagation after AdminSDHolder change |
 | `-LogPath` | `.\Logs\GR-Deploy-<timestamp>.csv` | Output path for the structured deployment log |
-| `-WhatIf` | — | Simulate all operations without making changes |
+| `-WhatIf` | — | Simulate all operations; log is still written with `WhatIf_Active` marker |
+
+---
+
+## Remove
+
+Removes the domain root ACE. By default the security group is preserved, making re-deployment a single command.
+
+```powershell
+.\Remove-GlobalReader.ps1
+```
+
+### Remove AdminSDHolder ACE as well
+
+```powershell
+.\Remove-GlobalReader.ps1 -RemoveAdminSDHolder
+```
+
+To trigger immediate SDProp propagation after removal:
+
+```powershell
+.\Remove-GlobalReader.ps1 -RemoveAdminSDHolder -TriggerSDProp
+```
+
+### Remove the group too
+
+Warns if the group has members. Clears `ProtectedFromAccidentalDeletion` before deleting.
+
+```powershell
+.\Remove-GlobalReader.ps1 -RemoveGroup
+```
+
+### Dry run
+
+```powershell
+.\Remove-GlobalReader.ps1 -WhatIf
+```
+
+---
+
+## Remove parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-IdentityName` | `GS-Global-Readers` | Name of the security group |
+| `-TargetOU` | Domain root DN | DN from which to remove the ACE |
+| `-RemoveAdminSDHolder` | `$false` | Also remove the ACE from AdminSDHolder |
+| `-RemoveGroup` | `$false` | Delete the security group after removing ACEs |
+| `-TriggerSDProp` | `$false` | Trigger immediate SDProp propagation after AdminSDHolder change |
+| `-LogPath` | `.\Logs\GR-Remove-<timestamp>.csv` | Output path for the removal log |
+| `-WhatIf` | — | Simulate all operations; log is still written with `WhatIf_Active` marker |
+
+All removal operations are idempotent. Re-running when the ACE or group is already absent logs a `_Skipping` action and exits cleanly.
+
+---
+
+## AdminSDHolder gap
+
+Without AdminSDHolder coverage, `GS-Global-Readers` cannot read accounts protected by SDProp (`Domain Admins`, `Schema Admins`, `Enterprise Admins`, `Administrators`, Account Operators, etc.). SDProp runs every 60 minutes on the PDC Emulator and overwrites the DACL on those accounts, stripping any inherited ACE from the domain root delegation.
+
+Applying the ACE to `CN=AdminSDHolder,CN=System,<DomainDN>` causes SDProp to propagate it forward to all protected accounts. This is opt-in (`-ApplyAdminSDHolder -Force`) and reversible (`Remove-GlobalReader.ps1 -RemoveAdminSDHolder`).
+
+**SDProp timing:** Changes take effect within the next SDProp cycle (up to 60 minutes) unless `-TriggerSDProp` is used, which writes `runProtectAdminGroupsTask=1` to the PDC Emulator's RootDSE for immediate propagation.
+
+---
+
+## Audit and reporting
+
+`Get-GRReport.ps1` produces an HTML and/or CSV report without modifying any AD objects.
+
+```powershell
+# Default: HTML + CSV report, current domain
+.\Get-GRReport.ps1
+
+# Specify output path and format
+.\Get-GRReport.ps1 -OutputPath 'C:\Reports' -Format HTML
+
+# Check inherited ACE presence on sampled OUs
+.\Get-GRReport.ps1 -CheckInheritance
+
+# Use in a monitoring pipeline: exits 1 if health is degraded
+.\Get-GRReport.ps1 -FailOnMissingAce
+```
+
+**Report sections:**
+
+1. **Role Health** — group existence, domain root ACE, AdminSDHolder ACE
+2. **Group Membership** — members with `LastLogonDate` and enabled status
+3. **AdminSDHolder Gap Analysis** — all `adminCount=1` objects and whether they are covered
+4. **Inheritance Spot-Check** *(optional, `-CheckInheritance`)* — samples up to 5 OUs and verifies inherited ACE presence
 
 ---
 
@@ -106,35 +230,43 @@ Before making any changes the deployer verifies:
 
 Every operation is safe to re-run:
 
-- **Group**: checked by name before creation. If it exists, `Group_Exists_Skipping` is logged and the existing object is returned.
-- **ACE**: before calling `Set-Acl`, the deployer reads the current DACL and looks for an explicit (non-inherited) Allow ACE for the group SID that includes `ReadProperty`. If found, `ACE_Exists_Skipping` is logged and `Set-Acl` is not called.
+| Operation | Already done | Action |
+|---|---|---|
+| Group creation | Group exists | `Group_Exists_Skipping` logged; existing object returned |
+| ACE application | ACE present | `ACE_Exists_Skipping` logged; `Set-Acl` not called |
+| ACE removal | ACE absent | `ACE_NotFound_Skipping` logged; exits cleanly |
+| Group removal | Group absent | `Group_NotFound_Skipping` logged; exits cleanly |
+| AdminSDHolder apply | ACE present | `AdminSDHolder_ACE_Exists_Skipping` logged |
+| AdminSDHolder remove | ACE absent | `AdminSDHolder_ACE_NotFound_Skipping` logged |
 
 ---
 
-## Verification
+## Testing
 
-After deployment, run `Verify-Deployment.ps1` to confirm the ACE is present and re-run the deployer to confirm idempotency:
+Tests require Pester v5. `Bootstrap.ps1` installs it automatically from PSGallery if needed.
 
 ```powershell
-# Verify defaults
-.\Verify-Deployment.ps1
+# Unit tests only (no AD required)
+.\Tests\Bootstrap.ps1 -Tags Unit
 
-# Verify a custom group on a specific OU
-.\Verify-Deployment.ps1 `
-    -IdentityName 'GS-SIEM-Readers' `
-    -TargetDN     'OU=Servers,DC=ad,DC=example,DC=com'
+# Integration tests (requires Domain Admin session)
+.\Tests\Bootstrap.ps1 -Tags Integration
 ```
 
-| Parameter | Default | Description |
-|---|---|---|
-| `-IdentityName` | `GS-Global-Readers` | Group name to verify |
-| `-TargetDN` | Domain root DN | DN to check for the ACE |
+**Unit tests:** 22 tests covering `New-GR-Group`, `Set-GR-Delegation`, and `Remove-GR-Delegation` across happy-path, idempotency, WhatIf, and error contexts. All AD and ACL calls are mocked.
+
+**Integration tests:** 29 tests in five phases executed against a real domain:
+1. Deploy (group + ACE creation)
+2. Idempotency (re-run produces only skip actions)
+3. Remove (WhatIf first, then real; WhatIf log verified)
+4. Restore (re-deploy after removal)
+5. AdminSDHolder (real apply + remove with SDProp trigger)
 
 ---
 
 ## Log format
 
-All operations are written to a UTF-8 CSV at `$LogPath`.
+All operations write a UTF-8 CSV at `$LogPath`. Logs are written even under `-WhatIf`; a `WhatIf_Active` marker row is prepended so simulated runs are clearly distinguishable in audit trails.
 
 | Field | Description |
 |---|---|
@@ -148,10 +280,19 @@ All operations are written to a UTF-8 CSV at `$LogPath`.
 
 | Code | Meaning |
 |---|---|
+| `WhatIf_Active` | First row in any WhatIf run; confirms log is a simulation |
 | `Group_Created` | Group was created successfully |
 | `Group_Exists_Skipping` | Group already existed; no change made |
+| `Group_Removed` | Group was deleted successfully |
+| `Group_NotFound_Skipping` | Group already absent; removal skipped |
 | `ACE_Added` | ACE was applied via `Set-Acl` |
 | `ACE_Exists_Skipping` | ACE already present; `Set-Acl` not called |
+| `ACE_Removed` | ACE was removed via `Set-Acl` |
+| `ACE_NotFound_Skipping` | ACE already absent; removal skipped |
+| `AdminSDHolder_ACE_Added` | ACE applied to AdminSDHolder |
+| `AdminSDHolder_ACE_Exists_Skipping` | AdminSDHolder ACE already present; skipped |
+| `AdminSDHolder_ACE_Removed` | ACE removed from AdminSDHolder |
+| `AdminSDHolder_ACE_NotFound_Skipping` | AdminSDHolder ACE already absent; skipped |
 | `PreFlight_OK` | Pre-flight check passed |
 | `PreFlight_Warning` | Pre-flight check produced a non-fatal warning |
 | `PreFlight_Error` | Pre-flight check failed (deployment aborted) |
@@ -174,15 +315,17 @@ All operations are written to a UTF-8 CSV at `$LogPath`.
 - `WriteProperty`, `WriteDacl`, `WriteOwner`, `Delete`, `DeleteTree`
 - Access to **confidential attributes** (`searchFlags` bit 128 in the schema, e.g., LAPS `ms-LAPS-Password`, `ms-PKI-DPAPIMasterKeys`) — these require an explicit `ControlAccess` delegation that this deployer never grants
 
-### AdminSDHolder gap
+---
 
-This role does **not** provide read access to accounts protected by AdminSDHolder (`Domain Admins`, `Schema Admins`, `Enterprise Admins`, `Administrators`, etc.). The SDProp process runs every 60 minutes and overwrites the DACL on protected accounts, stripping inherited ACEs. Delegating read access to those accounts requires a separate ACE on the AdminSDHolder object itself, which is explicitly out of scope.
+## DSC evaluation
+
+See [`Docs/DSC-Evaluation.md`](Docs/DSC-Evaluation.md) for a full evaluation of using the `ActiveDirectoryDsc` module (`ADObjectPermissionEntry`, `ADGroup`) to keep the role healthy via drift remediation. Short summary: a scheduled task running `Deploy-GlobalReader.ps1` is simpler and equally effective for most environments; DSC is recommended only where DSC infrastructure is already in place.
 
 ---
 
 ## Out of scope
 
 - Deleted Objects container (requires specialized rights)
-- AdminSDHolder modifications
 - Restricted groups / SAMR policy
 - Auditing pre-existing permissive ACEs that may make this role redundant
+- Cross-domain / forest-wide deployment (v3 candidate; see `Docs/V2-Decisions.md`)

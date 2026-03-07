@@ -29,6 +29,18 @@
     Full path to the output CSV log file.
     Default: .\Logs\GR-Deploy-<timestamp>.csv
 
+.PARAMETER ApplyAdminSDHolder
+    Also applies the Global Reader ACE to the AdminSDHolder object, which causes
+    SDProp to propagate read access to all admin-protected accounts (Domain Admins,
+    Schema Admins, etc.) within 60 minutes.
+
+    This deliberately expands read scope. Review Set-GR-AdminSDHolder.ps1 for full
+    security implications. Requires -Force to proceed.
+
+.PARAMETER Force
+    Required when -ApplyAdminSDHolder is specified, to acknowledge the security
+    implications of modifying AdminSDHolder.
+
 .PARAMETER WhatIf
     Simulate actions without making changes. Logs are still written.
 
@@ -45,6 +57,10 @@
         -LogPath       'C:\Logs\GR-Deploy.csv'
 
 .EXAMPLE
+    # Deploy including AdminSDHolder coverage (closes the AdminSDHolder Gap)
+    .\Deploy-GlobalReader.ps1 -ApplyAdminSDHolder -Force
+
+.EXAMPLE
     # Dry-run
     .\Deploy-GlobalReader.ps1 -WhatIf
 
@@ -54,24 +70,23 @@
 
     Out of scope (by design):
       - Deleted Objects container
-      - AdminSDHolder modifications
       - SAMR / restricted-group policy
       - Auditing pre-existing permissive ACEs
 
-    Version : 1.2
+    Version : 2.0
     Author  : AD-GR Deployer (Claude Code / Anthropic)
     Domain  : Derived at runtime — no hardcoded values
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
 param(
-    [string]$IdentityName = 'GS-Global-Readers',
-
-    [string]$TargetOU     = '',   # Empty = domain root
-
-    [string]$GroupOU      = '',   # Empty = domain Users container
-
-    [string]$LogPath      = ''    # Empty = auto-generated in .\Logs\
+    [string]$IdentityName       = 'GS-Global-Readers',
+    [string]$TargetOU           = '',   # Empty = domain root
+    [string]$GroupOU            = '',   # Empty = domain Users container
+    [string]$LogPath            = '',   # Empty = auto-generated in .\Logs\
+    [switch]$ApplyAdminSDHolder,        # Also apply ACE to AdminSDHolder object
+    [switch]$Force,                     # Required when -ApplyAdminSDHolder is set
+    [switch]$TriggerSDProp              # Trigger immediate SDProp after AdminSDHolder change
 )
 
 Set-StrictMode -Version Latest
@@ -95,6 +110,7 @@ if (-not $LogPath) {
 # Dot-source modules
 . (Join-Path $scriptRoot 'Modules\New-GR-Group.ps1')
 . (Join-Path $scriptRoot 'Modules\Set-GR-Delegation.ps1')
+. (Join-Path $scriptRoot 'Modules\Set-GR-AdminSDHolder.ps1')
 
 # ============================================================================
 # 1. Resolve domain context at runtime — NO hardcoded values
@@ -114,20 +130,28 @@ $TargetDN = if ($TargetOU) { $TargetOU } else { $DomainDN }
 
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor DarkCyan
-Write-Host "  AD Global Reader Deployer  v1.2" -ForegroundColor Cyan
+Write-Host "  AD Global Reader Deployer  v2.0" -ForegroundColor Cyan
 Write-Host "========================================================" -ForegroundColor DarkCyan
-Write-Host "  Domain   : $DomainFQDN" -ForegroundColor White
-Write-Host "  Target DN: $TargetDN" -ForegroundColor White
-Write-Host "  Group    : $IdentityName" -ForegroundColor White
-Write-Host "  Log      : $LogPath" -ForegroundColor White
-if ($WhatIfPreference) {
-    Write-Host "  MODE     : WhatIf (no changes will be made)" -ForegroundColor Yellow
-}
+Write-Host "  Domain             : $DomainFQDN" -ForegroundColor White
+Write-Host "  Target DN          : $TargetDN" -ForegroundColor White
+Write-Host "  Group              : $IdentityName" -ForegroundColor White
+Write-Host "  Log                : $LogPath" -ForegroundColor White
+if ($ApplyAdminSDHolder) { Write-Host '  ApplyAdminSDHolder : YES' -ForegroundColor Yellow }
+if ($WhatIfPreference)   { Write-Host '  MODE               : WhatIf (no changes will be made)' -ForegroundColor Yellow }
 Write-Host "========================================================" -ForegroundColor DarkCyan
 Write-Host ""
 
 # ============================================================================
-# 2. Pre-flight validation
+# 2. WhatIf marker (logged before any operations so the CSV is always stamped)
+# ============================================================================
+if ($WhatIfPreference) {
+    Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action WhatIf_Active `
+        -Principal ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
+        -Details "WhatIf mode active. No changes will be made to Active Directory. Log entries below reflect what WOULD have happened."
+}
+
+# ============================================================================
+# 3. Pre-flight validation
 # ============================================================================
 Write-Host "[Step 1/3] Running pre-flight checks..." -ForegroundColor DarkCyan
 
@@ -144,7 +168,7 @@ if (-not $preFlightOK) {
 Write-Host "[Step 1/3] Pre-flight checks passed." -ForegroundColor Green
 
 # ============================================================================
-# 3. Module 1 — Create the Global Reader security group
+# 4. Module 1 — Create the Global Reader security group
 # ============================================================================
 Write-Host "[Step 2/3] Ensuring Global Reader group exists..." -ForegroundColor DarkCyan
 
@@ -186,7 +210,27 @@ catch {
 }
 
 # ============================================================================
-# 5. Summary
+# 5. Module 3 (optional) — Apply ACE to AdminSDHolder
+# ============================================================================
+if ($ApplyAdminSDHolder) {
+    Write-Host "[Step 4/4] Applying Global Reader ACE to AdminSDHolder..." -ForegroundColor DarkCyan
+
+    try {
+        Set-GRAdminSDHolder -IdentityName $IdentityName -LogPath $LogPath `
+            -Force:$Force -TriggerSDProp:$TriggerSDProp -WhatIf:$WhatIfPreference
+        Write-Host "[Step 4/4] AdminSDHolder ACE applied. SDProp propagates within 60 minutes." -ForegroundColor Green
+    }
+    catch {
+        Write-GRLog -LogPath $LogPath -TargetDN "CN=AdminSDHolder,CN=System,$DomainDN" -Action Error `
+            -Principal $IdentityName `
+            -Details "AdminSDHolder ACE failed: $_"
+        Write-Error "AdminSDHolder ACE failed. See log: $LogPath"
+        exit 1
+    }
+}
+
+# ============================================================================
+# 6. Summary
 # ============================================================================
 Write-Host ""
 Write-Host "========================================================" -ForegroundColor DarkCyan
