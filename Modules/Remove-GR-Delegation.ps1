@@ -17,6 +17,8 @@
     Does NOT touch any other ACEs on the target object.
 #>
 
+. (Join-Path $PSScriptRoot '..\Helpers\Find-GRAce.ps1')
+
 function Remove-GRDelegation {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -58,32 +60,7 @@ function Remove-GRDelegation {
     }
 
     # ---- Find the matching explicit ACE ------------------------------------
-    # Same candidate filter used by Set-GR-Delegation for consistency:
-    #   - Non-inherited (explicit at this level)
-    #   - Allow ACE
-    #   - Contains ReadProperty in the rights mask
-    $candidateAces = $acl.Access | Where-Object {
-        -not $_.IsInherited -and
-        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-        ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) -ne 0
-    }
-
-    $targetAce = $null
-    foreach ($ace in $candidateAces) {
-        $aceSid = $null
-        try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-        catch { $aceSid = $null }
-
-        if ($aceSid -and $aceSid -eq $groupSid.Value) {
-            $targetAce = $ace
-            break
-        }
-        # Fallback: string comparison (covers DOMAIN\samAccountName format)
-        if ($ace.IdentityReference.Value -like "*$IdentityName*") {
-            $targetAce = $ace
-            break
-        }
-    }
+    $targetAce = Find-GRAce -Acl $acl -SidValue $groupSid.Value -IdentityName $IdentityName
 
     if (-not $targetAce) {
         Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action ACE_NotFound_Skipping `

@@ -62,6 +62,8 @@
     Set-GRAdminSDHolder -IdentityName 'GS-Global-Readers' -LogPath 'C:\Logs\gr.csv' -Force
 #>
 
+. (Join-Path $PSScriptRoot '..\Helpers\Find-GRAce.ps1')
+
 function Set-GRAdminSDHolder {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -123,27 +125,7 @@ function Set-GRAdminSDHolder {
     }
 
     # ---- Idempotency check -------------------------------------------------
-    $candidateAces = $acl.Access | Where-Object {
-        -not $_.IsInherited -and
-        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-        ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) -ne 0
-    }
-
-    $existingAce = $null
-    foreach ($ace in $candidateAces) {
-        $aceSid = $null
-        try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-        catch { $aceSid = $null }
-
-        if ($aceSid -and $aceSid -eq $groupSid.Value) {
-            $existingAce = $ace
-            break
-        }
-        if ($ace.IdentityReference.Value -like "*$IdentityName*") {
-            $existingAce = $ace
-            break
-        }
-    }
+    $existingAce = Find-GRAce -Acl $acl -SidValue $groupSid.Value -IdentityName $IdentityName
 
     if ($existingAce) {
         Write-GRLog -LogPath $LogPath -TargetDN $adminSDHolderDN -Action AdminSDHolder_ACE_Exists_Skipping `
@@ -187,7 +169,7 @@ function Set-GRAdminSDHolder {
 
             if ($TriggerSDProp) {
                 try {
-                    $pdcFqdn = $domain.PDCEmulator
+                    $pdcFqdn = (Get-ADDomain -ErrorAction Stop).PDCEmulator
                     $rootDSE = [ADSI]"LDAP://$pdcFqdn/RootDSE"
                     $rootDSE.Put("runProtectAdminGroupsTask", "1")
                     $rootDSE.SetInfo()

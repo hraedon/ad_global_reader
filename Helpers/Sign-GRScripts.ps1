@@ -47,6 +47,7 @@
       Verify-Deployment.ps1
       Helpers\Write-GRLog.ps1
       Helpers\Test-GRPreFlight.ps1
+      Helpers\Find-GRAce.ps1
       Helpers\Sign-GRScripts.ps1  (this file)
       Modules\New-GR-Group.ps1
       Modules\Set-GR-Delegation.ps1
@@ -153,6 +154,7 @@ $scripts = [System.Collections.Generic.List[string]]@(
     (Join-Path $root 'Verify-Deployment.ps1')
     (Join-Path $root 'Helpers\Write-GRLog.ps1')
     (Join-Path $root 'Helpers\Test-GRPreFlight.ps1')
+    (Join-Path $root 'Helpers\Find-GRAce.ps1')
     (Join-Path $root 'Helpers\Sign-GRScripts.ps1')
     (Join-Path $root 'Modules\New-GR-Group.ps1')
     (Join-Path $root 'Modules\Set-GR-Delegation.ps1')

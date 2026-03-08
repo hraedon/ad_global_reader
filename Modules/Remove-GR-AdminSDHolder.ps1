@@ -53,6 +53,8 @@
     Remove-GRAdminSDHolder -IdentityName 'GS-Global-Readers' -LogPath 'C:\Logs\gr.csv'
 #>
 
+. (Join-Path $PSScriptRoot '..\Helpers\Find-GRAce.ps1')
+
 function Remove-GRAdminSDHolder {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -100,27 +102,7 @@ function Remove-GRAdminSDHolder {
     }
 
     # ---- Find the matching explicit ACE ------------------------------------
-    $candidateAces = $acl.Access | Where-Object {
-        -not $_.IsInherited -and
-        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-        ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) -ne 0
-    }
-
-    $targetAce = $null
-    foreach ($ace in $candidateAces) {
-        $aceSid = $null
-        try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-        catch { $aceSid = $null }
-
-        if ($aceSid -and $aceSid -eq $groupSid.Value) {
-            $targetAce = $ace
-            break
-        }
-        if ($ace.IdentityReference.Value -like "*$IdentityName*") {
-            $targetAce = $ace
-            break
-        }
-    }
+    $targetAce = Find-GRAce -Acl $acl -SidValue $groupSid.Value -IdentityName $IdentityName
 
     if (-not $targetAce) {
         Write-GRLog -LogPath $LogPath -TargetDN $adminSDHolderDN -Action AdminSDHolder_ACE_NotFound_Skipping `

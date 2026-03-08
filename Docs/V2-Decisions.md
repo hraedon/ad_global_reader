@@ -160,3 +160,73 @@ A non-obvious requirement is that every file the deployer dot-sources (`. (Join-
 
 **Re-signing after edits:**
 `Set-AuthenticodeSignature` appends a signature block to the file. Any subsequent edit invalidates it. Operators must re-run `Sign-GRScripts.ps1` after every change to any file in the tree before deploying to an `AllSigned` environment. This is documented in the README.
+
+---
+
+## V2.5 Additions
+
+### Goal 5: Shared ACE-matching helper (`Helpers\Find-GRAce.ps1`)
+
+**Problem:** The ACE-matching loop (pre-filter to non-inherited Allow+ReadProperty ACEs, SID translate with string-fallback) was duplicated verbatim in four modules:
+`Set-GR-Delegation`, `Remove-GR-Delegation`, `Set-GR-AdminSDHolder`, `Remove-GR-AdminSDHolder`.
+A fifth variant also existed inside `Get-GRReport.ps1` as a local function. This violated DRY and, more importantly, each copy called `NTAccount.Translate()` internally, making the ACE-matching step inseparable from its AD dependency.
+
+**Decision: separate SID resolution from ACE matching.**
+`Find-GRAce` in `Helpers\Find-GRAce.ps1` accepts a pre-resolved `$SidValue` string (the caller's responsibility), an `$Acl` object (also the caller's), and `$IdentityName` (string fallback). It performs no AD calls — pure ACL inspection. This makes the function independently testable with any SID string and any ACL object, including PSCustomObject mocks.
+
+**Module pattern:** Each module dot-sources `Find-GRAce.ps1` at the script level (not inside its function body), using its own `$PSScriptRoot` to locate the relative path `'..\Helpers\Find-GRAce.ps1'`. This makes each module self-contained: whether loaded by an orchestrator or directly by a test's dot-source, `Find-GRAce` is guaranteed available before the function is called.
+
+**Unit test coverage:** `Tests\Find-GRAce.Tests.ps1` tests the ACE-matching logic in complete isolation using PSCustomObject mock ACEs — no live AD, no NTAccount.Translate(). This provides the "mockable without AD" benefit that was the stated goal of the refactoring.
+
+**Get-GRReport.ps1 alignment:** The local `Find-GRAce` function was removed and replaced with the shared helper (dot-sourced at the top of the script). The three call sites that previously passed `$ADPath` now call `Get-Acl` inline and pass the result to `Find-GRAce`. Slightly more verbose at call sites; significantly cleaner overall.
+
+---
+
+### Goal 3 (fix): `$domain` scope risk in `Set-GR-AdminSDHolder.ps1`
+
+**Problem:** The `$TriggerSDProp` block used `$domain.PDCEmulator` where `$domain` was assigned at function entry. If the module is dot-sourced into a session that already has a `$domain` variable from a different cmdlet or script, the TriggerSDProp block would use a stale or wrong value.
+
+**Fix:** Replace `$domain.PDCEmulator` in the TriggerSDProp block with `(Get-ADDomain -ErrorAction Stop).PDCEmulator`. This is a fresh, self-contained resolution that doesn't depend on any outer-scope variable. `Remove-GR-AdminSDHolder` already used this pattern correctly.
+
+---
+
+### Goal 4: `Verify-Deployment.ps1` updated for v2
+
+**Changes:**
+- Added AdminSDHolder ACE check (Check 3), enabled via `-CheckAdminSDHolder`. Reported as informational (`INFO`) rather than `FAIL` since AdminSDHolder coverage is opt-in.
+- Updated to use the shared `Find-GRAce` helper for all ACE lookups (domain root and AdminSDHolder), replacing the previous ad-hoc inline Where-Object filter.
+- Added `-CheckAdminSDHolder` parameter with guidance on how to enable coverage if the gap is active.
+- Summary line now exits with code 1 on failure (consistent with integration test behavior).
+- Added `.SYNOPSIS`, `.DESCRIPTION`, and `.EXAMPLE` blocks to align with v2 style.
+
+**Kept:** The idempotency test (re-run Deploy-GlobalReader.ps1, expect skip actions) — this is the key human-facing validation that distinguishes Verify-Deployment from the Pester integration tests.
+
+---
+
+### Goal 1: Event-log integration in `Get-GRReport.ps1`
+
+**Decision: stub with local DC event log fallback, not a full SIEM integration.**
+
+A `-SiemEndpoint` parameter was added. When provided, the Logon Activity section displays sample queries for Splunk (SPL), Microsoft Sentinel (KQL), and Elastic (EQL) rather than making a real API call. The stub explicitly documents what a real integration would execute and prompts the operator to implement the API call for their specific SIEM.
+
+When `-SiemEndpoint` is NOT provided, the section attempts to query the PDC Emulator's Security event log for event ID 4624 events matching group member usernames (last 7 days, up to 200 events, first 10 members used in the XML filter). Access-denied and WinRM-unavailable failures are caught and surfaced as a "not configured" notice with actionable guidance, rather than silently omitting the section.
+
+**Key design choices:**
+- Local event log query is limited to 10 members to keep the FilterXml manageable. Operators with large groups should use `-SiemEndpoint`.
+- The section is always present in the report (never silently skipped), per the spec requirement to surface a clear notice when data is unavailable.
+- Event 4624 is filtered by `LogonType` 3 (Network) and 10 (RemoteInteractive) in the SIEM stub queries; the local XML filter queries all 4624 events for the named users (LogonType filtering would require an additional XML condition and was kept simple).
+
+---
+
+### Goal 2: Membership change alerting in `Get-GRReport.ps1`
+
+**Decision: automatic baseline compare on every report run, Windows Application event log on delta.**
+
+A baseline CSV is stored at `Logs\GR-Baseline-<GroupName>.csv`. On the first run, it is created automatically from the current membership. On every subsequent run, the current membership is compared against the baseline:
+- Additions and removals are surfaced as a `Write-Warning` to the console.
+- A Windows Application event log entry is written (EventId 8650, Source `AD-Global-Reader`) for each delta run. The source is registered automatically if not present.
+- Delta details are included in the HTML and CSV report output.
+
+The baseline is NOT updated automatically after a delta run. Operators acknowledge membership changes by re-running with `-RefreshBaseline`. This is a deliberate design choice: auto-updating the baseline would make the alert self-clearing and defeat the purpose of drift detection. The operator must explicitly confirm that a membership change was intentional before the alert is silenced.
+
+**Why Application log over Security log:** Writing to the Security log requires `SeAuditPrivilege`, which domain admin sessions don't always have. The Application log write succeeds in any elevated session and is more broadly monitored in SIEM pipelines.

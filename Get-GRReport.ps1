@@ -6,11 +6,13 @@
 
 .DESCRIPTION
     Produces a structured report covering:
-      1. Role Health    - Group existence, ACE on domain root, ACE on AdminSDHolder
-      2. Membership     - All members with last logon and enabled status
-      3. AdminSDHolder Gap Analysis - Protected accounts (adminCount=1) and
-                          whether Global Readers can see them
-      4. Inheritance Check - Spot-checks inherited ACE presence on sampled OUs
+      1. Role Health        - Group existence, ACE on domain root, ACE on AdminSDHolder
+      2. Group Membership   - All members with last logon and enabled status
+      3. Membership Alerts  - Baseline compare; warns and writes to event log on delta
+      4. Logon Activity     - Security event log query (4624) for group members,
+                              or SIEM endpoint stub if -SiemEndpoint is supplied
+      5. AdminSDHolder Gap  - Protected accounts (adminCount=1) and coverage status
+      6. Inheritance Check  - Spot-checks inherited ACE presence on sampled OUs
 
     Output formats: HTML report and/or CSV summary.
     Exits with code 1 if critical health checks fail (useful for scheduled monitoring).
@@ -39,14 +41,32 @@
     If set, exits with code 1 when the domain root ACE is missing.
     Useful for scheduled monitoring / alerting pipelines.
 
+.PARAMETER SiemEndpoint
+    Optional. URI of a SIEM API endpoint (Splunk, Sentinel, Elastic, etc.).
+    When supplied, the Logon Activity section displays a stub query that a real
+    integration would execute, rather than attempting a local event log query.
+    Example: 'https://splunk.example.com:8089'
+
+.PARAMETER RefreshBaseline
+    Update the stored membership baseline to the current group membership.
+    Use this after intentional membership changes to silence the delta alert.
+    Without this switch the baseline is created automatically on first run but
+    never updated automatically thereafter.
+
 .EXAMPLE
     .\Get-GRReport.ps1
 
 .EXAMPLE
     .\Get-GRReport.ps1 -CheckInheritance -FailOnMissingAce -Format HTML
 
+.EXAMPLE
+    .\Get-GRReport.ps1 -SiemEndpoint 'https://splunk.corp.example.com:8089'
+
+.EXAMPLE
+    .\Get-GRReport.ps1 -RefreshBaseline
+
 .NOTES
-    Version : 2.0
+    Version : 2.5
     Author  : AD-GR Deployer (Claude Code / Anthropic)
 #>
 
@@ -58,7 +78,9 @@ param(
     [ValidateSet('HTML','CSV','Both')]
     [string]$Format          = 'Both',
     [switch]$CheckInheritance,
-    [switch]$FailOnMissingAce
+    [switch]$FailOnMissingAce,
+    [string]$SiemEndpoint    = '',
+    [switch]$RefreshBaseline
 )
 
 Set-StrictMode -Version Latest
@@ -67,38 +89,18 @@ $ErrorActionPreference = 'Stop'
 $scriptRoot  = $PSScriptRoot
 $reportStamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 
+. (Join-Path $scriptRoot 'Helpers\Find-GRAce.ps1')
+
 if (-not $OutputPath) {
-    $OutputPath = Join-Path $scriptRoot "Logs\Reports"
+    $OutputPath = Join-Path $scriptRoot 'Logs\Reports'
 }
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
 }
 
-# ============================================================================
-# Helper: find explicit ACE for our group on a given AD path
-# ============================================================================
-function Find-GRAce {
-    param(
-        [string]$ADPath,
-        [string]$GroupSidValue,
-        [string]$GroupName
-    )
-    try {
-        $acl            = Get-Acl -Path $ADPath -ErrorAction Stop
-        $candidateAces  = $acl.Access | Where-Object {
-            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-            ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) -ne 0
-        }
-        foreach ($ace in $candidateAces) {
-            $aceSid = $null
-            try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-            catch { $aceSid = $null }
-            if ($aceSid -and $aceSid -eq $GroupSidValue)             { return $ace }
-            if ($ace.IdentityReference.Value -like "*$GroupName*")   { return $ace }
-        }
-    }
-    catch { }
-    return $null
+$logsRoot = Join-Path $scriptRoot 'Logs'
+if (-not (Test-Path $logsRoot)) {
+    New-Item -ItemType Directory -Path $logsRoot -Force | Out-Null
 }
 
 # ============================================================================
@@ -127,10 +129,10 @@ Write-Host '[Section 1] Role Health Check' -ForegroundColor DarkCyan
 
 $healthRows = [System.Collections.Generic.List[PSObject]]::new()
 
-# --- 2a. Group existence ---
-$group     = Get-ADGroup -Filter { Name -eq $IdentityName } `
-               -Properties Description,Created,ProtectedFromAccidentalDeletion `
-               -ErrorAction SilentlyContinue
+# --- Group existence ---
+$group = Get-ADGroup -Filter { Name -eq $IdentityName } `
+           -Properties Description,Created,ProtectedFromAccidentalDeletion `
+           -ErrorAction SilentlyContinue
 
 if ($group) {
     $memberCount = (Get-ADGroupMember -Identity $group.DistinguishedName -ErrorAction SilentlyContinue | Measure-Object).Count
@@ -145,19 +147,22 @@ else {
 }
 
 $healthRows.Add([PSCustomObject]@{
-    Check   = 'Group Exists'
-    Status  = $groupStatus
-    Detail  = $groupDetail
+    Check  = 'Group Exists'
+    Status = $groupStatus
+    Detail = $groupDetail
 })
 
-# --- 2b. Domain root ACE ---
+# --- Domain root ACE ---
 $domainRootAceStatus = 'MISSING'
 $domainRootAceDetail = 'ACE not found.'
 $groupSidValue       = $null
 
 if ($group) {
     $groupSidValue = $group.SID.Value
-    $rootAce = Find-GRAce -ADPath "AD:\$TargetDN" -GroupSidValue $groupSidValue -GroupName $IdentityName
+    $rootAcl = $null
+    try { $rootAcl = Get-Acl -Path "AD:\$TargetDN" -ErrorAction Stop } catch {}
+    $rootAce = if ($rootAcl) { Find-GRAce -Acl $rootAcl -SidValue $groupSidValue -IdentityName $IdentityName } else { $null }
+
     if ($rootAce) {
         $domainRootAceStatus = 'OK'
         $domainRootAceDetail = "Rights: $($rootAce.ActiveDirectoryRights) | Inherited: $($rootAce.IsInherited) | InheritanceType: $($rootAce.InheritanceType)"
@@ -172,31 +177,34 @@ else {
 }
 
 $healthRows.Add([PSCustomObject]@{
-    Check   = 'Domain Root ACE'
-    Status  = $domainRootAceStatus
-    Detail  = $domainRootAceDetail
+    Check  = 'Domain Root ACE'
+    Status = $domainRootAceStatus
+    Detail = $domainRootAceDetail
 })
 
-# --- 2c. AdminSDHolder ACE ---
+# --- AdminSDHolder ACE ---
 $adminSDHolderAceStatus = 'NOT_APPLIED'
 $adminSDHolderAceDetail = 'ACE not present on AdminSDHolder. Protected accounts (adminCount=1) are NOT covered by Global Readers.'
 
 if ($group) {
-    $ashAce = Find-GRAce -ADPath "AD:\$adminSDHolderDN" -GroupSidValue $groupSidValue -GroupName $IdentityName
+    $ashAcl = $null
+    try { $ashAcl = Get-Acl -Path "AD:\$adminSDHolderDN" -ErrorAction Stop } catch {}
+    $ashAce = if ($ashAcl) { Find-GRAce -Acl $ashAcl -SidValue $groupSidValue -IdentityName $IdentityName } else { $null }
+
     if ($ashAce) {
         $adminSDHolderAceStatus = 'OK'
         $adminSDHolderAceDetail = "ACE present on AdminSDHolder. SDProp propagates to protected accounts. Rights: $($ashAce.ActiveDirectoryRights)"
         Write-Host "  [OK]   AdminSDHolder ACE present (protected accounts covered)." -ForegroundColor Green
     }
     else {
-        Write-Host "  [INFO] AdminSDHolder ACE not applied (protected accounts not covered - AdminSDHolder Gap active)." -ForegroundColor Yellow
+        Write-Host "  [INFO] AdminSDHolder ACE not applied (AdminSDHolder Gap active -- protected accounts not covered)." -ForegroundColor Yellow
     }
 }
 
 $healthRows.Add([PSCustomObject]@{
-    Check   = 'AdminSDHolder ACE'
-    Status  = $adminSDHolderAceStatus
-    Detail  = $adminSDHolderAceDetail
+    Check  = 'AdminSDHolder ACE'
+    Status = $adminSDHolderAceStatus
+    Detail = $adminSDHolderAceDetail
 })
 
 # ============================================================================
@@ -219,13 +227,13 @@ if ($group) {
                            -Properties LastLogonDate,Enabled,Description -ErrorAction SilentlyContinue
                     if ($u) {
                         $memberDetail = [PSCustomObject]@{
-                            Name            = $u.Name
-                            SAMAccountName  = $u.SamAccountName
-                            ObjectClass     = 'user'
-                            Enabled         = $u.Enabled
-                            LastLogonDate   = if ($u.LastLogonDate) { $u.LastLogonDate.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
-                            Description     = $u.Description
-                            DN              = $u.DistinguishedName
+                            Name           = $u.Name
+                            SAMAccountName = $u.SamAccountName
+                            ObjectClass    = 'user'
+                            Enabled        = $u.Enabled
+                            LastLogonDate  = if ($u.LastLogonDate) { $u.LastLogonDate.ToString('yyyy-MM-dd HH:mm') } else { 'Never' }
+                            Description    = $u.Description
+                            DN             = $u.DistinguishedName
                         }
                     }
                 }
@@ -234,25 +242,25 @@ if ($group) {
                            -Properties Description -ErrorAction SilentlyContinue
                     if ($g) {
                         $memberDetail = [PSCustomObject]@{
-                            Name            = $g.Name
-                            SAMAccountName  = $g.SamAccountName
-                            ObjectClass     = 'group'
-                            Enabled         = 'N/A'
-                            LastLogonDate   = 'N/A'
-                            Description     = $g.Description
-                            DN              = $g.DistinguishedName
+                            Name           = $g.Name
+                            SAMAccountName = $g.SamAccountName
+                            ObjectClass    = 'group'
+                            Enabled        = 'N/A'
+                            LastLogonDate  = 'N/A'
+                            Description    = $g.Description
+                            DN             = $g.DistinguishedName
                         }
                     }
                 }
                 elseif ($m.objectClass -eq 'computer') {
                     $memberDetail = [PSCustomObject]@{
-                        Name            = $m.Name
-                        SAMAccountName  = $m.SamAccountName
-                        ObjectClass     = 'computer'
-                        Enabled         = 'N/A'
-                        LastLogonDate   = 'N/A'
-                        Description     = ''
-                        DN              = $m.distinguishedName
+                        Name           = $m.Name
+                        SAMAccountName = $m.SamAccountName
+                        ObjectClass    = 'computer'
+                        Enabled        = 'N/A'
+                        LastLogonDate  = 'N/A'
+                        Description    = ''
+                        DN             = $m.distinguishedName
                     }
                 }
             }
@@ -274,10 +282,182 @@ else {
 }
 
 # ============================================================================
-# 4. AdminSDHolder Gap Analysis
+# 4. Membership Change Alert (baseline compare)
 # ============================================================================
 Write-Host ''
-Write-Host '[Section 3] AdminSDHolder Gap Analysis' -ForegroundColor DarkCyan
+Write-Host '[Section 3] Membership Change Alert' -ForegroundColor DarkCyan
+
+$safeGroupName  = $IdentityName -replace '[\\/:*?"<>|]', '_'
+$baselineFile   = Join-Path $logsRoot "GR-Baseline-$safeGroupName.csv"
+$memberAlertRows = [System.Collections.Generic.List[PSObject]]::new()
+
+if ($group) {
+    $currentSams = @($memberRows | Select-Object -ExpandProperty SAMAccountName)
+
+    if ((Test-Path $baselineFile) -and -not $RefreshBaseline) {
+        $baseline     = @(Import-Csv $baselineFile)
+        $baselineSams = @($baseline | Select-Object -ExpandProperty SAMAccountName)
+
+        $added   = @($currentSams | Where-Object { $baselineSams -notcontains $_ })
+        $removed = @($baselineSams | Where-Object { $currentSams -notcontains $_ })
+
+        if ($added.Count -gt 0 -or $removed.Count -gt 0) {
+            $addedStr   = if ($added.Count   -gt 0) { $added   -join ', ' } else { '(none)' }
+            $removedStr = if ($removed.Count -gt 0) { $removed -join ', ' } else { '(none)' }
+            $alertMsg   = "AD Global Reader group '$IdentityName' membership changed. Added: $addedStr. Removed: $removedStr."
+
+            Write-Warning $alertMsg
+
+            # Write to Application event log
+            $eventSource = 'AD-Global-Reader'
+            try {
+                if (-not [System.Diagnostics.EventLog]::SourceExists($eventSource)) {
+                    New-EventLog -LogName Application -Source $eventSource -ErrorAction Stop
+                }
+                Write-EventLog -LogName Application -Source $eventSource `
+                    -EventId 8650 -EntryType Warning -Message $alertMsg
+                Write-Host "  [ALERT] Membership delta written to Application event log (EventId 8650)." -ForegroundColor Yellow
+            }
+            catch {
+                Write-Host "  [ALERT] Membership delta detected but could not write to event log: $_" -ForegroundColor Yellow
+            }
+
+            foreach ($sam in $added)   { $memberAlertRows.Add([PSCustomObject]@{ SAMAccountName = $sam; Delta = 'ADDED';   BaselineDate = (Get-Item $baselineFile).LastWriteTimeUtc.ToString('yyyy-MM-dd') }) }
+            foreach ($sam in $removed) { $memberAlertRows.Add([PSCustomObject]@{ SAMAccountName = $sam; Delta = 'REMOVED'; BaselineDate = (Get-Item $baselineFile).LastWriteTimeUtc.ToString('yyyy-MM-dd') }) }
+        }
+        else {
+            Write-Host "  No membership changes detected since baseline ($($( (Get-Item $baselineFile).LastWriteTimeUtc.ToString('yyyy-MM-dd') )))." -ForegroundColor Green
+        }
+    }
+    elseif (Test-Path $baselineFile) {
+        # -RefreshBaseline was specified
+        Write-Host '  Baseline refresh requested.' -ForegroundColor Yellow
+    }
+    else {
+        Write-Host '  No baseline found -- creating on this run.' -ForegroundColor Yellow
+    }
+
+    # Create or refresh baseline
+    if (-not (Test-Path $baselineFile) -or $RefreshBaseline) {
+        $memberRows | Select-Object SAMAccountName, ObjectClass, DN |
+            Export-Csv -Path $baselineFile -NoTypeInformation -Encoding utf8 -Force
+        $action = if ($RefreshBaseline) { 'refreshed' } else { 'created' }
+        Write-Host "  Membership baseline $action`: $baselineFile" -ForegroundColor Green
+        Write-Host "  Re-run without -RefreshBaseline to detect future deltas." -ForegroundColor White
+    }
+}
+else {
+    Write-Host '  Cannot run baseline check - group not found.' -ForegroundColor Red
+}
+
+# ============================================================================
+# 5. Logon Activity (SIEM stub / local Security event log)
+# ============================================================================
+Write-Host ''
+Write-Host '[Section 4] Logon Activity' -ForegroundColor DarkCyan
+
+$logonRows      = [System.Collections.Generic.List[PSObject]]::new()
+$memberUserSams = @($memberRows | Where-Object { $_.ObjectClass -eq 'user' } |
+                    Select-Object -ExpandProperty SAMAccountName)
+
+if ($SiemEndpoint) {
+    # STUB: document the query a real SIEM integration would execute.
+    # Replace this block with an API call to your SIEM when integrating.
+    $sampleNames = if ($memberUserSams.Count -gt 0) {
+        ($memberUserSams | Select-Object -First 5) -join ', '
+    } else { '(no user members)' }
+
+    Write-Host "  [STUB] SIEM endpoint: $SiemEndpoint" -ForegroundColor Yellow
+    Write-Host '  A real implementation would execute a query similar to:' -ForegroundColor Yellow
+    Write-Host "    Splunk SPL  : index=wineventlog EventCode=4624 LogonType IN (3,10) TargetUserName IN ($sampleNames, ...)" -ForegroundColor DarkGray
+    Write-Host "    KQL/Sentinel: SecurityEvent | where EventID==4624 and LogonType in (3,10) and TargetUserName in ($sampleNames, ...)" -ForegroundColor DarkGray
+    Write-Host "    Elastic EQL : sequence [authentication where event.code == '4624' and winlog.event_data.TargetUserName in ($sampleNames, ...)]" -ForegroundColor DarkGray
+
+    $logonRows.Add([PSCustomObject]@{
+        Status    = 'STUB_CONFIGURED'
+        Endpoint  = $SiemEndpoint
+        QueryNote = "Not implemented. Integrate with SIEM API at $SiemEndpoint. Query: EventCode=4624 LogonType IN (3,10) TargetUserName IN ($($memberUserSams -join ', '))"
+    })
+}
+elseif ($memberUserSams.Count -eq 0) {
+    Write-Host '  No user members -- no logon events to query.' -ForegroundColor Yellow
+    $logonRows.Add([PSCustomObject]@{ Status = 'NO_USER_MEMBERS'; QueryNote = 'Group has no user members. Add members and re-run, or configure -SiemEndpoint.' })
+}
+else {
+    # Attempt local query of the PDC Emulator Security event log.
+    # Requires: WinRM enabled on PDC, and caller is member of Event Log Readers on DCs.
+    $pdcFqdn   = $domain.PDCEmulator
+    $queryDays = 7
+    Write-Host "  Querying Security event log on '$pdcFqdn' (last $queryDays days, up to 200 events)..." -ForegroundColor White
+
+    # Limit filter to 10 accounts to keep the XML filter manageable.
+    # Use -SiemEndpoint for full-coverage queries against all members.
+    $filterSams = $memberUserSams | Select-Object -First 10
+    $userFilter = ($filterSams | ForEach-Object { "Data[@Name='TargetUserName']='$_'" }) -join ' or '
+
+    $filterXml = @"
+<QueryList>
+  <Query Id="0" Path="Security">
+    <Select Path="Security">
+      *[System[EventID=4624] and EventData[$userFilter]]
+    </Select>
+  </Query>
+</QueryList>
+"@
+
+    try {
+        $events = Get-WinEvent -ComputerName $pdcFqdn -FilterXml $filterXml `
+                      -MaxEvents 200 -ErrorAction Stop
+
+        foreach ($evt in $events) {
+            $evtXml  = [xml]$evt.ToXml()
+            $evtData = @{}
+            foreach ($d in $evtXml.Event.EventData.Data) {
+                $evtData[$d.Name] = $d.'#text'
+            }
+            $logonRows.Add([PSCustomObject]@{
+                TimeCreated     = $evt.TimeCreated.ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')
+                TargetUserName  = $evtData['TargetUserName']
+                LogonType       = $evtData['LogonType']
+                WorkstationName = $evtData['WorkstationName']
+                IpAddress       = $evtData['IpAddress']
+            })
+        }
+
+        if ($logonRows.Count -gt 0) {
+            Write-Host "  Found $($logonRows.Count) logon event(s) for monitored accounts in the last $queryDays days." -ForegroundColor Green
+        }
+        else {
+            Write-Host "  No matching logon events found in the last $queryDays days." -ForegroundColor Yellow
+        }
+
+        if ($memberUserSams.Count -gt 10) {
+            Write-Host "  NOTE: Filter limited to first 10 of $($memberUserSams.Count) user members. Use -SiemEndpoint for full-scope queries." -ForegroundColor Yellow
+        }
+    }
+    catch [System.UnauthorizedAccessException] {
+        Write-Host "  [NOT CONFIGURED] Access denied to Security event log on '$pdcFqdn'." -ForegroundColor Yellow
+        Write-Host '  To enable: add the running account to Event Log Readers on DCs, or use -SiemEndpoint.' -ForegroundColor Yellow
+        $logonRows.Add([PSCustomObject]@{
+            Status    = 'ACCESS_DENIED'
+            QueryNote = "Access denied to Security event log on $pdcFqdn. Add account to 'Event Log Readers' group on DCs, or configure -SiemEndpoint."
+        })
+    }
+    catch {
+        Write-Host "  [NOT CONFIGURED] Could not query Security event log: $_" -ForegroundColor Yellow
+        Write-Host '  Ensure WinRM is enabled on DCs, or use -SiemEndpoint for SIEM integration.' -ForegroundColor Yellow
+        $logonRows.Add([PSCustomObject]@{
+            Status    = 'NOT_AVAILABLE'
+            QueryNote = "Security event log query failed: $_. Ensure WinRM is enabled on DCs, or configure -SiemEndpoint."
+        })
+    }
+}
+
+# ============================================================================
+# 6. AdminSDHolder Gap Analysis
+# ============================================================================
+Write-Host ''
+Write-Host '[Section 5] AdminSDHolder Gap Analysis' -ForegroundColor DarkCyan
 
 $protectedRows = [System.Collections.Generic.List[PSObject]]::new()
 
@@ -296,13 +476,14 @@ try {
         else {
             'GAP - AdminSDHolder ACE not present; Global Readers cannot see these accounts.'
         }
-        Write-Host "  Status: $gapNote" -ForegroundColor $(if ($adminSDHolderAceStatus -eq 'OK') { 'Green' } else { 'Yellow' })
+        $gapColour = if ($adminSDHolderAceStatus -eq 'OK') { 'Green' } else { 'Yellow' }
+        Write-Host "  Status: $gapNote" -ForegroundColor $gapColour
 
         foreach ($obj in $protectedObjects) {
             $protectedRows.Add([PSCustomObject]@{
-                Name            = $obj.Name
-                ObjectClass     = $obj.objectClass
-                DN              = $obj.distinguishedName
+                Name               = $obj.Name
+                ObjectClass        = $obj.objectClass
+                DN                 = $obj.distinguishedName
                 GlobalReaderAccess = if ($adminSDHolderAceStatus -eq 'OK') { 'Covered (via AdminSDHolder)' } else { 'GAP - Not covered' }
             })
         }
@@ -316,43 +497,45 @@ catch {
 }
 
 # ============================================================================
-# 5. Inheritance Check (optional)
+# 7. Inheritance Check (optional)
 # ============================================================================
 $inheritanceRows = [System.Collections.Generic.List[PSObject]]::new()
 
 if ($CheckInheritance -and $group) {
     Write-Host ''
-    Write-Host '[Section 4] Inheritance Spot-Check' -ForegroundColor DarkCyan
+    Write-Host '[Section 6] Inheritance Spot-Check' -ForegroundColor DarkCyan
 
     $sampleOUs = @(Get-ADOrganizationalUnit -Filter * -ResultSetSize 5 `
                     -Properties DistinguishedName -ErrorAction SilentlyContinue)
 
     foreach ($ou in $sampleOUs) {
-        $inheritedAce = Find-GRAce -ADPath "AD:\$($ou.DistinguishedName)" `
-                            -GroupSidValue $groupSidValue -GroupName $IdentityName
-        $inherited    = if ($inheritedAce -and $inheritedAce.IsInherited) { 'YES' }
-                        elseif ($inheritedAce)                            { 'EXPLICIT' }
-                        else                                              { 'NOT_FOUND' }
+        $ouAcl = $null
+        try { $ouAcl = Get-Acl -Path "AD:\$($ou.DistinguishedName)" -ErrorAction SilentlyContinue } catch {}
+        $inheritedAce = if ($ouAcl) { Find-GRAce -Acl $ouAcl -SidValue $groupSidValue -IdentityName $IdentityName } else { $null }
+
+        $inherited = if ($inheritedAce -and $inheritedAce.IsInherited) { 'YES' }
+                     elseif ($inheritedAce)                            { 'EXPLICIT' }
+                     else                                              { 'NOT_FOUND' }
 
         $colour = if ($inherited -eq 'NOT_FOUND') { 'Red' } else { 'Green' }
         Write-Host "  [$inherited] $($ou.DistinguishedName)" -ForegroundColor $colour
 
         $inheritanceRows.Add([PSCustomObject]@{
-            OU             = $ou.DistinguishedName
-            InheritedACE   = $inherited
+            OU           = $ou.DistinguishedName
+            InheritedACE = $inherited
         })
     }
 }
 
 # ============================================================================
-# 6. Export
+# 8. Export
 # ============================================================================
 Write-Host ''
-Write-Host '[Section 5] Exporting Report' -ForegroundColor DarkCyan
+Write-Host '[Section 7] Exporting Report' -ForegroundColor DarkCyan
 
-$reportTitle  = "AD Global Reader Role Report - $DomainFQDN - $reportStamp"
-$htmlBase     = Join-Path $OutputPath "GR-Report-$reportStamp.html"
-$csvBase      = Join-Path $OutputPath "GR-Report-$reportStamp"
+$reportTitle = "AD Global Reader Role Report - $DomainFQDN - $reportStamp"
+$htmlBase    = Join-Path $OutputPath "GR-Report-$reportStamp.html"
+$csvBase     = Join-Path $OutputPath "GR-Report-$reportStamp"
 
 $cssStyle = @"
 <style>
@@ -375,11 +558,9 @@ if ($Format -in 'HTML','Both') {
     $null = $htmlSections.Append("<h1>$reportTitle</h1>")
     $null = $htmlSections.Append("<div class='meta'>Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC') | Domain: $DomainFQDN | Group: $IdentityName</div>")
 
-    # Health
     $null = $htmlSections.Append('<h2>Role Health</h2>')
     $null = $htmlSections.Append(($healthRows | ConvertTo-Html -Fragment))
 
-    # Members
     $null = $htmlSections.Append('<h2>Group Membership</h2>')
     if ($memberRows.Count -gt 0) {
         $null = $htmlSections.Append(($memberRows | ConvertTo-Html -Fragment))
@@ -388,7 +569,22 @@ if ($Format -in 'HTML','Both') {
         $null = $htmlSections.Append('<p>(No members)</p>')
     }
 
-    # Protected accounts
+    $null = $htmlSections.Append('<h2>Membership Change Alert</h2>')
+    if ($memberAlertRows.Count -gt 0) {
+        $null = $htmlSections.Append(($memberAlertRows | ConvertTo-Html -Fragment))
+    }
+    else {
+        $null = $htmlSections.Append('<p>(No membership changes detected)</p>')
+    }
+
+    $null = $htmlSections.Append('<h2>Logon Activity</h2>')
+    if ($logonRows.Count -gt 0) {
+        $null = $htmlSections.Append(($logonRows | ConvertTo-Html -Fragment))
+    }
+    else {
+        $null = $htmlSections.Append('<p>(No logon events found or query not available)</p>')
+    }
+
     $null = $htmlSections.Append('<h2>AdminSDHolder-Protected Objects</h2>')
     if ($protectedRows.Count -gt 0) {
         $null = $htmlSections.Append(($protectedRows | ConvertTo-Html -Fragment))
@@ -397,7 +593,6 @@ if ($Format -in 'HTML','Both') {
         $null = $htmlSections.Append('<p>(None found)</p>')
     }
 
-    # Inheritance
     if ($CheckInheritance -and $inheritanceRows.Count -gt 0) {
         $null = $htmlSections.Append('<h2>Inheritance Spot-Check</h2>')
         $null = $htmlSections.Append(($inheritanceRows | ConvertTo-Html -Fragment))
@@ -409,14 +604,20 @@ if ($Format -in 'HTML','Both') {
 }
 
 if ($Format -in 'CSV','Both') {
-    $healthRows   | Export-Csv -Path "${csvBase}-Health.csv"   -NoTypeInformation -Encoding utf8 -Force
-    $memberRows   | Export-Csv -Path "${csvBase}-Members.csv"  -NoTypeInformation -Encoding utf8 -Force
+    $healthRows    | Export-Csv -Path "${csvBase}-Health.csv"    -NoTypeInformation -Encoding utf8 -Force
+    $memberRows    | Export-Csv -Path "${csvBase}-Members.csv"   -NoTypeInformation -Encoding utf8 -Force
     $protectedRows | Export-Csv -Path "${csvBase}-Protected.csv" -NoTypeInformation -Encoding utf8 -Force
+    if ($memberAlertRows.Count -gt 0) {
+        $memberAlertRows | Export-Csv -Path "${csvBase}-MemberAlerts.csv" -NoTypeInformation -Encoding utf8 -Force
+    }
+    if ($logonRows.Count -gt 0) {
+        $logonRows | Export-Csv -Path "${csvBase}-LogonActivity.csv" -NoTypeInformation -Encoding utf8 -Force
+    }
     Write-Host "  CSV: ${csvBase}-Health.csv / -Members.csv / -Protected.csv" -ForegroundColor White
 }
 
 # ============================================================================
-# 7. Summary and exit
+# 9. Summary and exit
 # ============================================================================
 Write-Host ''
 Write-Host '========================================================' -ForegroundColor DarkCyan

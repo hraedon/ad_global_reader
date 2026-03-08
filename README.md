@@ -205,14 +205,33 @@ Applying the ACE to `CN=AdminSDHolder,CN=System,<DomainDN>` causes SDProp to pro
 
 # Use in a monitoring pipeline: exits 1 if health is degraded
 .\Get-GRReport.ps1 -FailOnMissingAce
+
+# SIEM logon activity stub (documents what query to run against your SIEM)
+.\Get-GRReport.ps1 -SiemEndpoint 'https://splunk.corp.example.com:8089'
+
+# Acknowledge a legitimate membership change and reset the baseline
+.\Get-GRReport.ps1 -RefreshBaseline
 ```
 
 **Report sections:**
 
 1. **Role Health** — group existence, domain root ACE, AdminSDHolder ACE
 2. **Group Membership** — members with `LastLogonDate` and enabled status
-3. **AdminSDHolder Gap Analysis** — all `adminCount=1` objects and whether they are covered
-4. **Inheritance Spot-Check** *(optional, `-CheckInheritance`)* — samples up to 5 OUs and verifies inherited ACE presence
+3. **Membership Change Alert** — compares current membership against a stored baseline CSV; writes to the Windows Application event log (EventId 8650) and emits a console warning on delta. Baseline auto-created on first run; update with `-RefreshBaseline` after intentional changes.
+4. **Logon Activity** — queries the PDC Emulator Security event log for event 4624 (network/remote logons) for group member accounts. If access is denied or WinRM is unavailable, surfaces a clear "not configured" notice with remediation steps. When `-SiemEndpoint` is provided, displays sample Splunk/Sentinel/Elastic queries instead.
+5. **AdminSDHolder Gap Analysis** — all `adminCount=1` objects and whether they are covered
+6. **Inheritance Spot-Check** *(optional, `-CheckInheritance`)* — samples up to 5 OUs and verifies inherited ACE presence
+
+| Parameter | Default | Description |
+|---|---|---|
+| `-IdentityName` | `GS-Global-Readers` | Group name |
+| `-TargetDN` | Domain root DN | DN expected to carry the ACE |
+| `-OutputPath` | `.\Logs\Reports\` | Output directory |
+| `-Format` | `Both` | `HTML`, `CSV`, or `Both` |
+| `-CheckInheritance` | — | Enable OU inheritance spot-check |
+| `-FailOnMissingAce` | — | Exit 1 when role health is degraded |
+| `-SiemEndpoint` | — | SIEM URI; activates query stub instead of local event log query |
+| `-RefreshBaseline` | — | Update membership baseline to current state |
 
 ---
 
@@ -239,6 +258,26 @@ Every operation is safe to re-run:
 | Group removal | Group absent | `Group_NotFound_Skipping` logged; exits cleanly |
 | AdminSDHolder apply | ACE present | `AdminSDHolder_ACE_Exists_Skipping` logged |
 | AdminSDHolder remove | ACE absent | `AdminSDHolder_ACE_NotFound_Skipping` logged |
+
+---
+
+## Verification
+
+`Verify-Deployment.ps1` is a human-facing spot-check tool. It confirms the group exists, the domain root ACE is in place, and re-runs the deployer to verify idempotency.
+
+```powershell
+# Basic verification
+.\Verify-Deployment.ps1
+
+# Include AdminSDHolder ACE check
+.\Verify-Deployment.ps1 -CheckAdminSDHolder
+
+# Custom group / target
+.\Verify-Deployment.ps1 -IdentityName 'GS-SIEM-Readers' `
+    -TargetDN 'OU=Servers,DC=ad,DC=example,DC=com' -CheckAdminSDHolder
+```
+
+The AdminSDHolder check is informational (`INFO`) — its absence is not treated as a failure since AdminSDHolder coverage is opt-in. Exits with code 1 if the group or domain root ACE is missing, or if the idempotency run produces errors.
 
 ---
 

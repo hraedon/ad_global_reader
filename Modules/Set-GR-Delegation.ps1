@@ -20,6 +20,8 @@
     Set-Acl is called. Existing ACEs are never removed or altered.
 #>
 
+. (Join-Path $PSScriptRoot '..\Helpers\Find-GRAce.ps1')
+
 function Set-GRDelegation {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -69,31 +71,7 @@ function Set-GRDelegation {
     #   - AccessControlType is Allow
     $groupSid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
 
-    # Build a pre-filtered list (no try/catch inside Where-Object — PS5.1 limitation).
-    # Compare IdentityReference as string (SAMAccountName or DOMAIN\name) and also
-    # try SID translation outside the pipeline for ACEs that support it.
-    $candidateAces = $acl.Access | Where-Object {
-        -not $_.IsInherited -and
-        $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-        ($_.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::ReadProperty) -ne 0
-    }
-
-    $existingAce = $null
-    foreach ($ace in $candidateAces) {
-        $aceSid = $null
-        try { $aceSid = $ace.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value }
-        catch { $aceSid = $null }
-
-        if ($aceSid -and $aceSid -eq $groupSid.Value) {
-            $existingAce = $ace
-            break
-        }
-        # Fallback: string comparison (covers DOMAIN\samAccountName format)
-        if ($ace.IdentityReference.Value -like "*$IdentityName*") {
-            $existingAce = $ace
-            break
-        }
-    }
+    $existingAce = Find-GRAce -Acl $acl -SidValue $groupSid.Value -IdentityName $IdentityName
 
     if ($existingAce) {
         Write-GRLog -LogPath $LogPath -TargetDN $TargetDN -Action ACE_Exists_Skipping `
