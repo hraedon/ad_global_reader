@@ -397,7 +397,6 @@ These were found by reading the code. None was run against a live domain here (n
 7. **Logon-activity query has no time range** (see report section 4). Expect the 200 most recent matching events returned by the PDC Emulator, not a fixed 7-day window.
 8. **Unit tests need the `ActiveDirectory` module** and, for the delegation tests, a domain-joined machine. See [Testing](#testing).
 9. **Signing helper does not sign `Tests\Find-GRAce.Tests.ps1`** when `-IncludeTests` is used (it is missing from the list in `Sign-GRScripts.ps1`).
-10. **No license file.** The repository has no `LICENSE`. The owner has not chosen one. Confirm terms with the owner before redistributing outside your organisation.
 
 ---
 
@@ -581,3 +580,7 @@ See [`Docs/DSC-Evaluation.md`](Docs/DSC-Evaluation.md) for a full evaluation of 
 **Known gaps and debts.** The list under [Behaviour notes and known issues](#behaviour-notes-and-known-issues) is the current debt list. Also open: the `-SiemEndpoint` integration is a stub; no least-privilege delegation set for the operator is documented; the contact for security reports is not yet documented (see [SECURITY.md](SECURITY.md)).
 
 **Depends on.** The `ActiveDirectory` RSAT module; a reachable writable DC and PDC Emulator; Pester v5 (tests); a code-signing certificate (AllSigned environments only).
+
+## License
+
+MIT. See [LICENSE](LICENSE).
