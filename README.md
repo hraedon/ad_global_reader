@@ -19,7 +19,7 @@ Allow | ReadProperty, ListChildren, ListObject | Inheritance: All
 - It does not add anyone to the group. You manage membership yourself.
 - It does not grant write, delete, `ControlAccess`, replication or any other right.
 - It does not touch the Deleted Objects container, restricted-group/SAMR policy, or existing permissive ACEs.
-- It does not deploy across several domains or a whole forest (a v3 candidate, see `Docs/V2-Decisions.md`).
+- It does not deploy across several domains or a whole forest.
 - The SIEM integration is a stub. It prints example queries; it does not call any SIEM API.
 
 ---
@@ -53,7 +53,7 @@ Allow | ReadProperty, ListChildren, ListObject | Inheritance: All
 | Requirement | Detail |
 |---|---|
 | PowerShell | 5.1 or later. Use Windows PowerShell 5.1 for `Get-GRReport.ps1`: the membership alert uses `New-EventLog` / `Write-EventLog`, which PowerShell 7 does not include (inferred from the cmdlets used; not tested on 7). |
-| RSAT module | `ActiveDirectory` (included in RSAT on Windows Server; install via `Add-WindowsCapability` on workstations). Every script has `#Requires -Modules ActiveDirectory`. |
+| RSAT module | `ActiveDirectory` (included in RSAT on Windows Server; install via `Add-WindowsCapability` on workstations). The entry scripts, the modules and the integration tests declare `#Requires -Modules ActiveDirectory`; the helpers and unit tests declare only `#Requires -Version 5.1`. |
 | Execution context | Run from a machine joined to the target domain, in a session authenticated as Domain Admin, or as an account with **WriteDacl** on the target container. No `-Credential` parameters exist; the scripts use your current Windows session. |
 | Pester | v5 or later, only for tests. `Tests\Bootstrap.ps1` installs it from PSGallery if missing. |
 
@@ -442,7 +442,7 @@ Tests require Pester v5. `Bootstrap.ps1` installs it automatically from PSGaller
 4. Restore (re-deploy after removal)
 5. AdminSDHolder (real apply + remove with SDProp trigger)
 
-**Static checks run for this documentation pass (PowerShell 7.6.6 on Linux, no AD):** every `.ps1` file parses with no syntax errors. `Find-GRAce.Tests.ps1`: 10 of 12 pass; the 2 failures create real ACL objects, which Linux does not support. The other unit test files and the integration tests cannot load without the `ActiveDirectory` module. PSScriptAnalyzer 1.25.0 with default rules reports no errors; warnings are mostly `PSAvoidUsingWriteHost` (177), plus a few empty catch blocks, missing BOM on 8 files and `ShouldProcess` notes. There is no PSScriptAnalyzer settings file and no CI configuration in the repository.
+**Static checks run for this documentation pass (PowerShell 7.6.6 on Linux, no AD):** every `.ps1` file parses with no syntax errors. `Find-GRAce.Tests.ps1`: 10 of 12 pass; the 2 failures create real ACL objects, which Linux does not support. The other unit test files and the integration tests cannot load without the `ActiveDirectory` module. PSScriptAnalyzer 1.25.0 with default rules reports no errors; warnings are mostly `PSAvoidUsingWriteHost` (about 178), plus a few empty catch blocks, missing BOM on 8 files and `ShouldProcess` notes. There is no PSScriptAnalyzer settings file and no CI configuration in the repository.
 
 ---
 
@@ -499,7 +499,7 @@ In raw terms the ACE is an Allow entry with access mask `0x94` (`ReadProperty` 0
 
 - `ControlAccess` — no Extended Rights of any kind, including *Read Password*, *Return Property*, *DS-Replication-Get-Changes*
 - `WriteProperty`, `WriteDacl`, `WriteOwner`, `Delete`, `DeleteTree`
-- Access to **confidential attributes** (`searchFlags` bit 128 in the schema, for example the LAPS password attributes) — these require an explicit `ControlAccess` delegation that this deployer never grants. The code comments also name `ms-PKI-DPAPIMasterKeys`; verify that attribute's flags in your own schema.
+- Access to **confidential attributes** (`searchFlags` bit 128 in the schema, for example the LAPS password attributes) — these require an explicit `ControlAccess` delegation that this deployer never grants. The code comments name the `ms-PKI-*` attribute family; verify those attributes' flags in your own schema.
 
 This protection applies only to attributes the schema flags as confidential. Review which sensitive attributes in your forest are not flagged before granting the role. Details and recommendations: [SECURITY.md](SECURITY.md).
 
@@ -547,7 +547,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 ## DSC evaluation
 
-See [`Docs/DSC-Evaluation.md`](Docs/DSC-Evaluation.md) for a full evaluation of using the `ActiveDirectoryDsc` module (`ADObjectPermissionEntry`, `ADGroup`) to keep the role healthy via drift remediation. Short summary: a scheduled task running `Deploy-GlobalReader.ps1` is simpler and equally effective for most environments; DSC is recommended only where DSC infrastructure is already in place. The repository does not ship a scheduled task definition; "Not yet documented: a ready-made scheduled-task setup."
+See [`Docs/DSC-Evaluation.md`](Docs/DSC-Evaluation.md) for a full evaluation of using the `ActiveDirectoryDsc` module (`ADObjectPermissionEntry`, `ADGroup`) to keep the role healthy via drift remediation. Short summary: a scheduled task running `Deploy-GlobalReader.ps1` is simpler and equally effective for most environments; DSC is recommended only where DSC infrastructure is already in place. A copy-paste scheduled-task setup (`AD-GlobalReader-Healthcheck`, daily) is in [`Docs/DSC-Evaluation.md`, Option 1](Docs/DSC-Evaluation.md#option-1-scheduled-task-recommended-for-most-environments).
 
 ---
 
@@ -556,7 +556,7 @@ See [`Docs/DSC-Evaluation.md`](Docs/DSC-Evaluation.md) for a full evaluation of 
 - Deleted Objects container (requires specialized rights)
 - Restricted groups / SAMR policy
 - Auditing pre-existing permissive ACEs that may make this role redundant
-- Cross-domain / forest-wide deployment (v3 candidate; see `Docs/V2-Decisions.md`)
+- Cross-domain / forest-wide deployment (not designed yet; `Docs/V2-Decisions.md` does not cover it)
 
 ---
 

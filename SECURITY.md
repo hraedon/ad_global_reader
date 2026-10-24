@@ -19,7 +19,7 @@ This document says what rights the deployer grants, to whom, and how to report a
 
 ## Limits of the confidentiality protection
 
-Leaving out `ControlAccess` keeps attributes that the schema flags as confidential (`searchFlags` bit 128) unreadable. That is Active Directory behaviour, and the code relies on it. It protects only flagged attributes. Everything else under the target is readable by group members, including attributes you may consider sensitive. Before granting the role, review your schema and the attributes you care about. The code comments name the LAPS password attributes and `ms-PKI-DPAPIMasterKeys` as examples; confirm each in your own forest (not verified here).
+Leaving out `ControlAccess` keeps attributes that the schema flags as confidential (`searchFlags` bit 128) unreadable. That is Active Directory behaviour, and the code relies on it. It protects only flagged attributes. Everything else under the target is readable by group members, including attributes you may consider sensitive. Before granting the role, review your schema and the attributes you care about. The code comments name LAPS and the `ms-PKI-*` attribute family as examples; confirm each in your own forest (not verified here).
 
 ## AdminSDHolder
 
